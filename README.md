@@ -18,3 +18,7 @@ In this study, we present an advanced image enhancement model that synergistical
 - Example outputs: See `figures/` for paper visuals or run inference to generate new ones.
 - Statistical significance: p < 0.0001 over baselines.
 
+# Acknowledgments
+- Based on IEEE INDISCON-2025 presentation.
+- Datasets: Waterloo Exploration Database, CIFAR-10.
+
