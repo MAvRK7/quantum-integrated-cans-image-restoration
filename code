@@ -1,0 +1,273 @@
+import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
+from torchvision import datasets, transforms
+import torchvision.utils as vutils
+from torch.autograd import Function
+import numpy as np
+from PIL import Image
+from skimage.metrics import structural_similarity as ssim
+from skimage.metrics import peak_signal_noise_ratio as psnr
+import argparse
+
+# Try importing CUDA Quantum; fallback to classical if not available
+try:
+    import cuda_quantum as cq
+    HAS_CUDA_Q = True
+except ImportError:
+    HAS_CUDA_Q = False
+    print("CUDA Quantum not found; running in classical mode. Install via: pip install cuda-quantum")
+
+class QuantumFunction(Function):
+    """
+    Autograd-compatible quantum function for 4-qubit variational circuit (paper: parameterized RX/RY).
+    Adapted from NVIDIA CUDA-Q examples (e.g., hybrid_qnns tutorial).
+    """
+    @staticmethod
+    def forward(ctx, input_features, params):
+        exp_vals = []
+        for feat in input_features.view(input_features.size(0), -1):  # Per batch item
+            kernel = cq.kernel()
+            q = kernel.qreg(4)  # 4 qubits as per paper
+            for i in range(4):
+                # Parameterized rotations (RX, RY scaled by features/params)
+                kernel.rx(parameter=params[i] * feat[i % len(feat)], target=q[i])
+                kernel.ry(parameter=params[i + 4] * feat[(i + 1) % len(feat)], target=q[i])
+            # Measure expectation <Z> on all qubits
+            exp = kernel.sample(q).expectation()
+            exp_vals.append(exp)
+        output = torch.tensor(exp_vals, device=input_features.device).unsqueeze(1)
+        ctx.save_for_backward(input_features, params)
+        return output.view_as(input_features)  # Reshape to original
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input_features, params = ctx.saved_tensors
+        # Simplified gradient (actual impl needs cq.adjoint or finite differences)
+        grad_input = grad_output.clone()
+        grad_params = torch.zeros_like(params)
+        return grad_input, grad_params
+
+class QuantumConvLayer(nn.Module):
+    """Quantum-enhanced convolutional layer with CUDA-Q (paper: integrates at each layer)."""
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU()
+        self.quantum_params = nn.Parameter(torch.randn(8)) if HAS_CUDA_Q else None  # 8 params for 4 qubits
+
+    def forward(self, x):
+        x = self.conv(x)
+        if HAS_CUDA_Q and self.quantum_params is not None:
+            b, c, h, w = x.shape
+            flat_x = x.view(b, -1)
+            enhanced = QuantumFunction.apply(flat_x, self.quantum_params)
+            x = enhanced.view(b, c, h, w) + x  # Residual enhancement
+        x = self.bn(x)
+        return self.relu(x)
+
+class Generator(nn.Module):
+    """U-Net style generator with residual connections and quantum enhancements."""
+    def __init__(self):
+        super().__init__()
+        # Encoder: 64 -> 512 filters, stride 2 after first
+        self.enc1 = QuantumConvLayer(3, 64)
+        self.enc2 = QuantumConvLayer(64, 128, stride=2)
+        self.enc3 = QuantumConvLayer(128, 256, stride=2)
+        self.enc4 = QuantumConvLayer(256, 512, stride=2)
+        # Bottleneck
+        self.bottleneck = QuantumConvLayer(512, 512)
+        # Decoder: Transposed conv with skip connections
+        self.dec4 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
+        self.dec3 = nn.ConvTranspose2d(512, 128, kernel_size=2, stride=2)  # Cat with enc4
+        self.dec2 = nn.ConvTranspose2d(256, 64, kernel_size=2, stride=2)   # Cat with enc3
+        self.dec1 = nn.ConvTranspose2d(128, 3, kernel_size=2, stride=2)    # Cat with enc2
+        self.tanh = nn.Tanh()
+
+    def forward(self, x):
+        # Encoder
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        e3 = self.enc3(e2)
+        e4 = self.enc4(e3)
+        # Bottleneck
+        b = self.bottleneck(e4)
+        # Decoder with skip connections
+        d4 = self.dec4(b)
+        d3 = self.dec3(torch.cat([d4, e4], dim=1))
+        d2 = self.dec2(torch.cat([d3, e3], dim=1))
+        d1 = self.dec1(torch.cat([d2, e2], dim=1))
+        out = self.tanh(torch.cat([d1, e1], dim=1))  # Final cat with enc1
+        return out + x  # Residual connection
+
+class Discriminator(nn.Module):
+    """Discriminator with 5 conv layers, quantum contrastive embeddings (paper: global coherence)."""
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 64, 4, stride=2, padding=1)
+        self.conv2 = nn.Conv2d(64, 128, 4, stride=2, padding=1)
+        self.conv3 = nn.Conv2d(128, 256, 4, stride=2, padding=1)
+        self.conv4 = nn.Conv2d(256, 512, 4, stride=2, padding=1)
+        self.conv5 = nn.Conv2d(512, 1, 4, stride=1, padding=0)
+        self.quantum_params = nn.Parameter(torch.randn(8)) if HAS_CUDA_Q else None
+
+    def forward(self, x):
+        x = F.leaky_relu(self.conv1(x), 0.2)
+        x = F.leaky_relu(self.conv2(x), 0.2)
+        x = F.leaky_relu(self.conv3(x), 0.2)
+        x = F.leaky_relu(self.conv4(x), 0.2)
+        if HAS_CUDA_Q and self.quantum_params is not None:
+            b, c, h, w = x.shape
+            flat_x = x.view(b, -1)
+            enhanced = QuantumFunction.apply(flat_x, self.quantum_params)
+            x = enhanced.view(b, c, h, w) + x  # Enhance embeddings
+        return torch.sigmoid(self.conv5(x))
+
+# Contrastive Loss (paper eq. 1)
+def contrastive_loss(real_feats, fake_feats, margin=1.0):
+    dist = torch.norm(real_feats - fake_feats, p=2, dim=1)
+    loss = torch.mean(dist ** 2 + torch.relu(margin - dist) ** 2)  # Simplified form
+    return loss
+
+# Custom Dataset for Waterloo
+class WaterlooDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        self.images = [os.path.join(root_dir, img) for img in os.listdir(root_dir) if img.endswith(('.png', '.jpg', '.jpeg'))]
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img_path = self.images[idx]
+        image = Image.open(img_path).convert('RGB')
+        if self.transform:
+            image = self.transform(image)
+        return image, 0  # Dummy label
+
+def get_dataloaders(batch_size=16):
+    # Preprocessing (paper: resize 256x256, normalize [-1,1], augment)
+    transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+    ])
+
+    # Waterloo: Assume extracted to ./data/waterloo/pristine_images/
+    if not os.path.exists('./data/waterloo/pristine_images'):
+        print("Download Waterloo from https://ivc.uwaterloo.ca/database/WaterlooExploration/ and extract to ./data/waterloo/pristine_images/")
+        exit(1)
+    full_dataset = WaterlooDataset(root='./data/waterloo/pristine_images', transform=transform)
+    train_size = 1800
+    val_size = 200
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    # CIFAR-10 for testing
+    cifar_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+    ])
+    cifar_test = datasets.CIFAR10(root='./data', train=False, download=True, transform=cifar_transform)
+    cifar_loader = DataLoader(cifar_test, batch_size=50, shuffle=True)  # 50 random as per paper
+
+    return train_loader, val_loader, cifar_loader
+
+def train(generator, discriminator, train_loader, val_loader, epochs=100, lr=2e-4, device='cuda'):
+    gen_opt = optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.999))
+    disc_opt = optim.Adam(discriminator.parameters(), lr=lr, betas=(0.5, 0.999))
+    bce = nn.BCELoss()
+    mse = nn.MSELoss()
+
+    generator.to(device)
+    discriminator.to(device)
+
+    for epoch in range(epochs):
+        generator.train()
+        for real_imgs, _ in train_loader:
+            batch_size = real_imgs.size(0)
+            real_imgs = real_imgs.to(device)
+            # Add Gaussian noise (sigma=0.1)
+            noisy_imgs = real_imgs + 0.1 * torch.randn_like(real_imgs).to(device)
+            noisy_imgs = torch.clamp(noisy_imgs, -1, 1)
+
+            # Train Discriminator
+            disc_opt.zero_grad()
+            fake_imgs = generator(noisy_imgs).detach()
+            real_pred = discriminator(real_imgs)
+            fake_pred = discriminator(fake_imgs)
+            real_feats = discriminator.conv4(real_imgs)
+            fake_feats = discriminator.conv4(fake_imgs)
+            cont_loss_d = contrastive_loss(real_feats.view(batch_size, -1), fake_feats.view(batch_size, -1))
+            d_loss = bce(real_pred, torch.ones_like(real_pred)) + bce(fake_pred, torch.zeros_like(fake_pred)) + cont_loss_d
+            d_loss.backward()
+            disc_opt.step()
+
+            # Train Generator
+            gen_opt.zero_grad()
+            fake_imgs = generator(noisy_imgs)
+            fake_pred = discriminator(fake_imgs)
+            real_feats = discriminator.conv4(real_imgs)
+            fake_feats = discriminator.conv4(fake_imgs)
+            adv_loss = bce(fake_pred, torch.ones_like(fake_pred))
+            pixel_loss = mse(fake_imgs, real_imgs)
+            cont_loss_g = contrastive_loss(real_feats.view(batch_size, -1), fake_feats.view(batch_size, -1))
+            g_loss = 1.0 * cont_loss_g + 1.0 * adv_loss + 100.0 * pixel_loss  # Weights from paper
+            g_loss.backward()
+            gen_opt.step()
+
+        print(f"Epoch [{epoch+1}/{epochs}] G Loss: {g_loss.item():.4f} D Loss: {d_loss.item():.4f}")
+        if (epoch + 1) % 10 == 0:
+            torch.save(generator.state_dict(), f'results/gen_epoch_{epoch+1}.pth')
+
+def test(generator, cifar_loader, device='cuda'):
+    generator.eval()
+    generator.to(device)
+    ssims, psnrs = [], []
+    with torch.no_grad():
+        for real_imgs, _ in cifar_loader:  # Single batch of 50
+            real_imgs = F.interpolate(real_imgs, size=256, mode='bilinear', align_corners=False).to(device)
+            noisy_imgs = real_imgs + 0.1 * torch.randn_like(real_imgs).to(device)
+            noisy_imgs = torch.clamp(noisy_imgs, -1, 1)
+            restored = generator(noisy_imgs)
+            real_np = ((real_imgs.permute(0, 2, 3, 1).cpu().numpy() + 1) / 2).clip(0, 1)
+            restored_np = ((restored.permute(0, 2, 3, 1).cpu().numpy() + 1) / 2).clip(0, 1)
+            for i in range(50):  # 50 images as per paper
+                s = ssim(real_np[i], restored_np[i], multichannel=True, data_range=1.0)
+                p = psnr(real_np[i], restored_np[i], data_range=1.0)
+                ssims.append(s)
+                psnrs.append(p)
+            break
+    avg_ssim = np.mean(ssims)
+    avg_psnr = np.mean(psnrs)
+    print(f"Avg SSIM: {avg_ssim:.4f} (Target: 0.8873), Avg PSNR: {avg_psnr:.4f} (Target: 22.5981)")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'])
+    parser.add_argument('--epochs', type=int, default=100)
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--lr', type=float, default=2e-4)
+    parser.add_argument('--load_path', type=str, default=None, help='Path to load generator for test')
+    args = parser.parse_args()
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    generator = Generator()
+    discriminator = Discriminator()
+    train_loader, val_loader, cifar_loader = get_dataloaders(args.batch_size)
+
+    if args.mode == 'train':
+        train(generator, discriminator, train_loader, val_loader, args.epochs, args.lr, device)
+    elif args.mode == 'test':
+        if args.load_path:
+            generator.load_state_dict(torch.load(args.load_path))
+        test(generator, cifar_loader, device)
